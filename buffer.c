@@ -2,8 +2,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +9,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "buffer.h"
-#include "wikigrab.h"
 
 static inline void
 __buf_reset_head(buf_t *buf)
@@ -112,7 +109,7 @@ buf_shift(buf_t *buf, off_t offset, size_t range)
 	size_t slack = buf_slack(buf);
 
 	if (range >= slack)
-		buf_extend(buf, __ALIGN((range - slack)));
+		buf_extend(buf, BUF_ALIGN_SIZE((range - slack)));
 
 /*
  * Do this AFTER extending since memory might be
@@ -172,7 +169,7 @@ buf_append(buf_t *buf, char *str)
 
 	if (len >= slack)
 	{
-		buf_extend(buf, __ALIGN((len - slack)));
+		buf_extend(buf, BUF_ALIGN_SIZE((len - slack)));
 	}
 
 	strcat(buf->buf_tail, str);
@@ -191,7 +188,7 @@ buf_append_ex(buf_t *buf, char *str, size_t bytes)
 	size_t slack = buf_slack(buf);
 
 	if (bytes >= slack)
-		buf_extend(buf, __ALIGN((bytes - slack)));
+		buf_extend(buf, BUF_ALIGN_SIZE((bytes - slack)));
 
 	strncpy(buf->buf_tail, str, bytes);
 
@@ -261,7 +258,7 @@ buf_read_fd(int fd, buf_t *buf, size_t bytes)
 		return 0;
 
 	if (bytes >= slack)
-		buf_extend(buf, __ALIGN((bytes - slack)));
+		buf_extend(buf, BUF_ALIGN_SIZE((bytes - slack)));
 
 	while (toread > 0)
 	{
@@ -284,176 +281,6 @@ buf_read_fd(int fd, buf_t *buf, size_t bytes)
 
 	fail:
 	return (ssize_t)-1;
-}
-
-ssize_t
-buf_read_socket(int sock, buf_t *buf, size_t toread)
-{
-	assert(buf);
-
-	ssize_t n = 0;
-	ssize_t total = 0;
-	size_t slack;
-	int sock_flags;
-
-	if (!SOCK_SET_FLAG_ONCE)
-	{
-		sock_flags = fcntl(sock, F_GETFL);
-		if (!(sock_flags & O_NONBLOCK))
-			fcntl(sock, F_SETFL, sock_flags | O_NONBLOCK);
-
-		SOCK_SET_FLAG_ONCE = 1;
-	}
-
-	slack = buf_slack(buf);
-
-	if (toread >= slack)
-		buf_extend(buf, __ALIGN((toread - slack)));
-
-	while (1)
-	{
-		n = recv(sock, buf->buf_tail, slack, 0);
-
-		if (!n)
-		{
-			break;
-		}
-		else
-		if (n < 0)
-		{
-			if (errno == EINTR)
-			{
-				continue;
-			}
-			else
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-			{
-				break;
-			}
-			else
-			{
-				goto fail;
-			}
-		}
-		else
-		{
-			__buf_pull_tail(buf, (size_t)n);
-
-			slack -= n;
-			total += n;
-
-			if (!slack)
-			{
-				slack += buf->buf_size;
-				buf_extend(buf, buf->buf_size);
-			}
-		}
-	}
-
-	return total;
-
-	fail:
-	return -1;
-}
-
-ssize_t
-buf_read_tls(SSL *ssl, buf_t *buf, size_t toread)
-{
-	assert(ssl);
-	assert(buf);
-
-	size_t slack;
-	//ssize_t n;
-	int n;
-	ssize_t total = 0;
-	int ssl_error = 0;
-	int read_socket = 0;
-	int slept_for = 0;
-	struct timeval timeout = {0};
-	fd_set rdfds;
-	int sock_flags;
-
-	read_socket = SSL_get_rfd(ssl);
-
-	if (!SOCK_SSL_SET_FLAG_ONCE)
-	{
-		sock_flags = fcntl(read_socket, F_GETFL);
-		if (!(sock_flags & O_NONBLOCK))
-			fcntl(read_socket, F_SETFL, sock_flags | O_NONBLOCK);
-
-		SOCK_SSL_SET_FLAG_ONCE = 1;
-	}
-
-	slack = buf_slack(buf);
-
-	if (toread >= slack)
-		buf_extend(buf, __ALIGN((toread - slack)));
-
-	while (1)
-	{
-		n = SSL_read(ssl, buf->buf_tail, slack);
-
-		if (!n)
-		{
-			break;
-		}
-		else
-		if (n < 0)
-		{
-			if (errno == EINTR)
-			{
-				continue;
-			}
-			else
-			{
-				ssl_error = SSL_get_error(ssl, n);
-
-				switch(ssl_error)
-				{
-					case SSL_ERROR_NONE:
-						continue;
-					case SSL_ERROR_WANT_READ:
-						FD_ZERO(&rdfds);
-						FD_SET(read_socket, &rdfds);
-						timeout.tv_sec = 1;
-						slept_for = select(read_socket+1, &rdfds, NULL, NULL, &timeout);
-
-						if (slept_for < 0)
-						{
-							fprintf(stderr, "buf_read_tls: select error (%s)\n", strerror(errno));
-							goto fail;
-						}
-						else
-						if (!slept_for)
-							goto out;
-						else
-							continue;
-					default:
-						goto fail;
-				}
-			}
-		}
-		else
-		{
-			__buf_pull_tail(buf, (size_t)n);
-
-			slack -= n;
-			total += n;
-
-			if (!slack)
-			{
-				slack += buf->buf_size;
-				buf_extend(buf, buf->buf_size);
-			}
-		}
-	} /* while (1) */
-
-	out:
-	return total;
-
-	fail:
-	return -1;
-	
 }
 
 ssize_t
@@ -493,98 +320,6 @@ buf_write_fd(int fd, buf_t *buf)
 	return -1;
 }
 
-ssize_t
-buf_write_socket(int sock, buf_t *buf)
-{
-	assert(buf);
-
-	size_t towrite = buf->data_len;
-	ssize_t n = 0;
-	ssize_t total = 0;
-
-	while (towrite > 0)
-	{
-		n = send(sock, buf->buf_head, towrite, 0);
-
-		if (!n)
-		{
-			break;
-		}
-		else
-		if (n < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			else
-				goto fail;
-		}
-
-		__buf_pull_head(buf, (size_t)n);
-		towrite -= n;
-		total += n;
-	}
-
-	__buf_reset_head(buf);
-	return total;
-
-	fail:
-	fprintf(stderr, "buf_write_socket: %s\n", strerror(errno));
-	return -1;
-}
-
-ssize_t
-buf_write_tls(SSL *ssl, buf_t *buf)
-{
-	assert(buf);
-	assert(ssl);
-
-	size_t towrite = buf->data_len;
-	ssize_t n = 0;
-	ssize_t total = 0;
-
-	while (towrite > 0)
-	{
-		n = SSL_write(ssl, buf->buf_head, towrite);
-		if (!n)
-		{
-			break;
-		}
-		else
-		if (n < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			else
-			{
-				int ssl_error = SSL_get_error(ssl, n);
-
-				switch(ssl_error)
-				{
-					case SSL_ERROR_NONE:
-						continue;
-					case SSL_ERROR_ZERO_RETURN:
-						goto fail;
-					case SSL_ERROR_WANT_WRITE:
-						continue;
-					default:
-						goto fail;
-				}
-			}
-		}
-
-		__buf_pull_head(buf, (size_t)n);
-		towrite -= n;
-		total += n;
-
-	} /* while (towrite > 0) */
-
-	__buf_reset_head(buf);
-	return total;
-
-	fail:
-	return -1;
-}
-
 buf_t *
 buf_dup(buf_t *copy)
 {
@@ -612,7 +347,7 @@ buf_copy(buf_t *to, buf_t *from)
 	assert(from);
 
 	if (to->buf_size < from->buf_size)
-		buf_extend(to, __ALIGN((from->buf_size - to->buf_size)));
+		buf_extend(to, BUF_ALIGN_SIZE((from->buf_size - to->buf_size)));
 
 	memcpy(to->data, from->data, from->buf_size);
 	to->buf_head = (to->data + (from->buf_head - from->data));
