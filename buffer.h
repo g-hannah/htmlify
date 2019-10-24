@@ -22,6 +22,7 @@ typedef struct buf_t
 #define buf_slack(b)	((b)->buf_size - buf_used(b))
 
 #define BUF_NULL_TERMINATE(b) (*((b)->buf_tail) = 0)
+#define BUF_ALIGN_SIZE(s) (((s) + 0xf) & ~(0xf))
 
 int buf_init(buf_t *, size_t) __nonnull((1));
 void buf_destroy(buf_t *) __nonnull((1));
