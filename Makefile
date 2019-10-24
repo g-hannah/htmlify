@@ -6,11 +6,17 @@ WFLAGS=-Wall -Werror
 GFLAGS=-g
 ALLFLAGS=$(GFLAGS) $(WFLAGS)
 
-htmlify: $(OFILES)
-	$(CC) $(ALLFLAGS) -o htmlify $(OFILES) $(LIBS)
+SOURCE_FILES := \
+	buffer.c \
+	htmlify.c
 
-$(OFILES): $(CFILES)
-	$(CC) $(ALLFLAGS) -c $(CFILES)
+OBJECT_FILES := ${SOURCE_FILES:.c=.o}
+
+htmlify: $(OBJECT_FILES)
+	$(CC) $(ALLFLAGS) -o htmlify $(OBJECT_FILES) $(LIBS)
+
+$(OBJECT_FILES): $(SOURCE_FILES)
+	$(CC) $(ALLFLAGS) -c $^
 
 clean:
 	rm *.o
