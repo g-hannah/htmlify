@@ -8,23 +8,53 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "buffer.h"
 
-
-#define IBUF_SIZE	4096
-#define OBUF_SIZE	16384
+#define QUOTE "&quot;"
+#define APOS "&apos;"
+#define LANGLE "&lt;"
+#define RANGLE "&gt;"
+#define AMPER "&amp;"
 
 static int		fd, ofd;
 static struct stat	statb;
-static char		*IBUF = NULL, *OBUF = NULL, *TMP = NULL;
 static int		P_PARITY;
 
 static char		PARAGRAPH_TAG[256] = "<p>";
 static char		HEADING_TAG[256] = "<h1>";
 static char		HEADING_CLOSE[256] = "";
 
+static buf_t IBUF;
+static buf_t OBUF;
+static buf_t TMP;
+
 void usage(int) __attribute__ ((__noreturn__));
 int get_heading_close(char *, char *) __nonnull ((1,2)) __wur;
 int create_page(char *fname, char *out) __nonnull ((1,2)) __wur;
+
+static void
+__attribute__((constructor)) htmify_init(void)
+{
+	if (buf_init(&IBUF, DEFAULT_BUFSIZE) < 0)
+		goto fail;
+	if (buf_init(&OBUF, DEFAULT_BUFSIZE) < 0)
+		goto fail;
+
+	return;
+
+	fail:
+	fprintf(stderr, "htmlify_init: failed to allocate memory for buffers\n");
+	exit(EXIT_FAILURE);
+}
+
+static void
+__attribute__((destructor)) htmlify_fini(void)
+{
+	buf_destroy(&IBUF);
+	buf_destroy(&OBUF);
+
+	return;
+}
 
 int
 main(int argc, char *argv[])
@@ -32,9 +62,9 @@ main(int argc, char *argv[])
 	static char		c;
 
 	while ((c = getopt(argc, argv, "p:H:h")) != -1)
-	  {
+	{
 		switch(c)
-		  {
+		{
 			case(0x70):
 			assert(strlen(optarg) < 256);
 			strncpy(PARAGRAPH_TAG, optarg, 256);
@@ -48,11 +78,14 @@ main(int argc, char *argv[])
 			break;
 			default:
 			usage(EXIT_FAILURE);
-		  }
-	  }
+		}
+	}
 
 	if (get_heading_close(HEADING_TAG, HEADING_CLOSE) == -1)
-	  { fprintf(stderr, "main() > get_heading_close()\n"); exit(0xff); }
+	{
+		fprintf(stderr, "main() > get_heading_close()\n");
+		goto fail;
+	}
 
 	fprintf(stdout,
 		"Paragraph tag: %s\n"
@@ -66,18 +99,25 @@ main(int argc, char *argv[])
 		usage(EXIT_FAILURE);
 
 	if (create_page(argv[optind], argv[optind+1]) < 0)
-	  { fprintf(stderr, "main() > create_page()"); }
+	{
+		fprintf(stderr, "main() > create_page()");
+		goto fail;
+	}
 
 	exit(EXIT_SUCCESS);
+
+	fail:
+	exit(EXIT_FAILURE);
 }
 
 int
 create_page(char *fname, char *out)
 {
-	static char		*p = NULL, *q = NULL, *a = NULL;
-	static size_t		tsize;
-	static ssize_t		n;
-	static int		i, nlcnt;
+	char *p = NULL;
+	char *a = NULL;
+	size_t	tsize;
+	int i;
+	int nlcnt;
 
 	if (access(fname, F_OK) != 0)
 	  { fprintf(stderr, "create_page(): file does not exist\n"); return(-1); }
@@ -90,12 +130,6 @@ create_page(char *fname, char *out)
 	if (lstat(fname, &statb) < 0)
 	  { fprintf(stderr, "create_page() > lstat(): %s\n", strerror(errno)); return(-1); }
 
-	if (!(IBUF = malloc(statb.st_size+1)))
-	  { fprintf(stderr, "create_page() > malloc(): %s\n", strerror(errno)); return(-1); }
-
-	if (!(OBUF = malloc((statb.st_size*3))))
-	  { fprintf(stderr, "create_page() > malloc(): %s\n", strerror(errno)); return(-1); }
-
 	if ((fd = open(fname, O_RDONLY)) < 0)
 	  { fprintf(stderr, "create_page() > open(): %s\n", strerror(errno)); return(-1); }
 
@@ -104,158 +138,185 @@ create_page(char *fname, char *out)
 	
 	tsize = statb.st_size;
 	i &= ~i;
-	sprintf(OBUF, "%s", PARAGRAPH_TAG);
+	buf_append(&OBUF, PARAGRAPH_TAG);
 	P_PARITY = 1;
 
-	n = read_n(fd, IBUF, statb.st_size);
-	q = (OBUF + strlen(PARAGRAPH_TAG));
-	p = IBUF;
+	buf_read_fd(fd, &IBUF, statb.st_size);
+	p = IBUF.buf_head;
 
 	while (tsize > 0)
-	  {
+	{
 		nlcnt &= ~nlcnt;
-		while (p < (IBUF + statb.st_size))
-		  {
+		while (p < (IBUF.buf_tail))
+		{
 			if (*p == 0x22)
-			  {
-			  	sprintf(q, "&quot;");
-				q+=6;
+			{
+				buf_append(&OBUF, QUOTE);
+
 				++p;
-				if (p == (IBUF + n))
+
+				if (p >= IBUF.buf_tail)
 					break;
-			  }
-			else if (*p == 0x0a || *p == 0x0d)
-			  {
+			}
+			else
+			if (*p == 0x0a || *p == 0x0d)
+			{
 				if ((*p == 0x0d && *(p+2) == 0x0d) || (*p == 0x0a && *(p+1) == 0x0a)) // new para
-				  {
+				{
 					if (nlcnt == 0) // isolated line, use <h1> tags
-					  {
-						a = q;
+					{
+						a = OBUF.buf_tail;
 
 						while (1)
-						  {
-							while (*a != 0x3c && a > (OBUF + 1))
+						{
+							while (*a != 0x3c && a > (OBUF.buf_head + 1))
 								--a;
+
 							if (strncasecmp(PARAGRAPH_TAG, a, strlen(PARAGRAPH_TAG)) != 0)
-							  { --a; continue; }
+							{
+								--a;
+								continue;
+							}
 							else
-							  { break; }
-						  }
+							{
+								break;
+							}
+						}
 
 						a += strlen(PARAGRAPH_TAG);
-						if (!(TMP = malloc((q - a)+1)))
-							return(-1);
 
-						strncpy(TMP, a, (q - a));
-						TMP[(q - a)] = 0;
+						if (buf_init(&TMP, BUF_ALIGN_SIZE((OBUF.buf_tail - a))) < 0)
+						{
+							fprintf(stderr, "create_page: failed to initialise temporary buffer (buf_init)\n");
+							goto fail;
+						}
+
+						buf_append_ex(&TMP, a, (OBUF.buf_tail - a));
+						BUF_NULL_TERMINATE(&TMP);
 						a -= strlen(PARAGRAPH_TAG);
 
-						strcpy(a, HEADING_TAG);
+						buf_push(&OBUF, (OBUF.buf_tail - a));
+						buf_append(&OBUF, HEADING_TAG);
 						P_PARITY = 0;
-						a += strlen(HEADING_TAG);
 
-						strncpy(a, TMP, strlen(TMP));
-						a += strlen(TMP);
-						free(TMP);
-						q = a;
+						buf_append_ex(&OBUF, TMP.buf_head, TMP.data_len);
+						buf_destroy(&TMP);
 
-						sprintf(q, "%s\n%s", HEADING_CLOSE, PARAGRAPH_TAG);
+						buf_append(&OBUF, HEADING_CLOSE);
+						buf_append(&OBUF, "\n");
+						buf_append(&OBUF, PARAGRAPH_TAG);
 						P_PARITY = 1;
 
-						q += (strlen(HEADING_CLOSE) + strlen(PARAGRAPH_TAG) + 1);
+						while ((*p == 0x0a || *p == 0x0d) && p < IBUF.buf_tail)
+							++p;
 
-						while ((*p == 0x0a || *p == 0x0d) && p < (IBUF + statb.st_size))
-							++p;
 						nlcnt &= ~nlcnt;
-						if (p >= (IBUF + statb.st_size)) // not IBUF_SIZE
+						if (p >= IBUF.buf_tail) // not IBUF_SIZE
 							break;
-					  }
+					}
 					else // nlcnt != 0
-					  {
-						sprintf(q, "</p>\n%s", PARAGRAPH_TAG);
-						q += (5 + strlen(PARAGRAPH_TAG));
-						while ((*p == 0x0a || *p == 0x0d) && p < (IBUF + statb.st_size))
+					{
+						buf_append(&OBUF, "</p>\n");
+						buf_append(&OBUF, PARAGRAPH_TAG);
+						while ((*p == 0x0a || *p == 0x0d) && p < IBUF.buf_tail)
 							++p;
+
 						nlcnt &= ~nlcnt;
-						if (p >= (IBUF + statb.st_size))
+						if (p >= IBUF.buf_tail)
 							break;
 							
-					  }
-				  }
+					}
+				}
 				else
 				// next char not 0x0a / *(p+2) not a 0x0d
 				  {
 					if (*p == 0x0d)
 						++p;
-					if (p >= (IBUF + statb.st_size))
+
+					if (p >= IBUF.buf_tail)
 						break;
 
-					*q++ = *p++;
+					 ++p;
+
 					++nlcnt;
-					if (p >= (IBUF + statb.st_size))
+
+					if (p >= IBUF.buf_tail)
 						break;
 				  }
 			  }
-			else if (*p == 0x27)
-			  {
-				sprintf(q, "&apos;");
-				q+=6;
-				++p;
-				if (p >= (IBUF + statb.st_size))
-					break;
-			  }
-			else if (*p == 0x26)
-			  {
-				sprintf(q, "&amp;");
-				q+=5;
-				++p;
-				if (p >= (IBUF + statb.st_size))
-					break;
-			  }
-			else if (*p == 0x3c)
-			  {
-				sprintf(q, "&lt;");
-				q+=4;
-				++p;
-				if (p >= (IBUF + statb.st_size))
-					break;
-			  }
-			else if (*p == 0x3d)
-			  {
-				sprintf(q, "&#61;");
-				q+=5;
-				++p;
-				if (p >= (IBUF + statb.st_size))
-					break;
-			  }
-			else if (*p == 0x3e)
-			  {
-				sprintf(q, "&gt;");
-				q+=4;
-				++p;
-				if (p >= (IBUF + statb.st_size))
-					break;
-			  }
 			else
-			  {
-				*q++ = *p++;
-				if (p >= (IBUF + statb.st_size))
+			if (*p == 0x27)
+			{
+				buf_append(&OBUF, APOS);
+
+				++p;
+
+				if (p >= IBUF.buf_tail)
 					break;
-			  }
-		  }
+			}
+			else
+			if (*p == 0x26)
+			{
+				buf_append(&OBUF, AMPER);
+
+				++p;
+
+				if (p >= IBUF.buf_tail)
+					break;
+			}
+			else
+			if (*p == 0x3c)
+			{
+				buf_append(&OBUF, LANGLE);
+
+				++p;
+
+				if (p >= IBUF.buf_tail)
+					break;
+			}
+			else
+			if (*p == 0x3d)
+			{
+				buf_append(&OBUF, "&#61;");
+
+				++p;
+
+				if (p >= IBUF.buf_tail)
+					break;
+			}
+			else
+			if (*p == 0x3e)
+			{
+				buf_append(&OBUF, RANGLE);
+
+				++p;
+
+				if (p >= IBUF.buf_tail)
+					break;
+			}
+			else
+			{
+				++p;
+
+				if (p >= IBUF.buf_tail)
+					break;
+			}
+		}
 
 		if (P_PARITY == 1)
-		  { strncpy(q, "</p>", 4); q += 4; }
-		*q = 0;
-		write_n(ofd, OBUF, (q - OBUF));
-		tsize -= n;
-	  }
+		{
+			buf_append(&OBUF, "</p>");
+		}
 
-	sync();
+		buf_write_fd(ofd, &OBUF);
+		tsize -= (p - IBUF.buf_head);
+	}
+
 	close(ofd);
-	free(IBUF);
-	free(OBUF);
 	return(0);
+
+	fail:
+	return -1;
 }
 
 int
